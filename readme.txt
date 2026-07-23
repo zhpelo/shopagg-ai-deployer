@@ -4,7 +4,7 @@ Tags: ai, deployment, backup, recovery, developer-tools
 Requires at least: 6.5
 Tested up to: 7.0
 Requires PHP: 8.0
-Stable tag: 1.2.1
+Stable tag: 1.3.0
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -20,6 +20,8 @@ Main features:
 * Atomic file deployment
 * Automatic snapshots before changes
 * Health checks and automatic rollback
+* Safe single-plugin and bulk plugin updates
+* GitHub-backed updates for SHOPAGG AI Deployer
 * Plugin and theme management
 * Post management
 * Cache clearing
@@ -40,6 +42,13 @@ Never commit `includes/config.php` or the `backups` directory. Regenerate the AP
 
 == Changelog ==
 
+= 1.3.0 =
+
+* Added REST endpoints to check, update, and bulk-update installed plugins.
+* Added full plugin snapshots, compatibility checks, health validation, and automatic rollback around plugin updates.
+* Added GitHub-backed update metadata for SHOPAGG AI Deployer with commit-pinned packages.
+* Expanded the built-in AI prompt with explicit plugin update safety rules and examples.
+
 = 1.2.1 =
 
 * Renamed the REST namespace to `shopagg-ai-deployer/v1`.
@@ -55,4 +64,3 @@ Never commit `includes/config.php` or the `backups` directory. Regenerate the AP
 = 1.1.0 =
 
 * Added REST deployment, backups, health checks, and Standalone recovery.
-
