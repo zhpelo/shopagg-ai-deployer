@@ -49,6 +49,15 @@ class WB_Deployer_API {
         );
 
         $this->route($namespace, '/plugins', 'GET', 'handle_list_plugins', $authenticated);
+        $this->route($namespace, '/plugins/updates', 'GET', 'handle_list_plugin_updates', $authenticated);
+        $this->route($namespace, '/plugins/update-all', 'POST', 'handle_update_all_plugins', $authenticated);
+        $this->route(
+            $namespace,
+            '/plugins/(?P<slug>[a-zA-Z0-9_-]+)/update',
+            'POST',
+            'handle_update_plugin',
+            $authenticated
+        );
         $this->route(
             $namespace,
             '/plugins/(?P<slug>[a-zA-Z0-9_-]+)/activate',
@@ -349,6 +358,103 @@ class WB_Deployer_API {
         return $this->response(['success' => true, 'plugins' => $this->get_plugins_data()]);
     }
 
+    public function handle_list_plugin_updates(WP_REST_Request $request): WP_REST_Response {
+        $force = filter_var($request->get_param('force') ?? false, FILTER_VALIDATE_BOOLEAN);
+        $updates = $this->get_available_plugin_updates($force);
+
+        return $this->response([
+            'success' => true,
+            'checked_at' => gmdate('c'),
+            'forced' => $force,
+            'count' => count($updates),
+            'updates' => array_values($updates),
+        ]);
+    }
+
+    public function handle_update_plugin(WP_REST_Request $request): WP_REST_Response {
+        $slug = sanitize_key((string) $request->get_param('slug'));
+        if ($slug === 'shopagg-ai-deployer') {
+            return $this->error('Remote self-update is denied. Update SHOPAGG AI Deployer through a reviewed deployment.', 400);
+        }
+
+        $lock = $this->acquire_plugin_update_lock('single:' . $slug);
+        if (is_wp_error($lock)) {
+            return $this->error($lock->get_error_message(), 409);
+        }
+
+        try {
+            $force = filter_var($request->get_param('force_check') ?? true, FILTER_VALIDATE_BOOLEAN);
+            $updates = $this->get_available_plugin_updates($force);
+            if (!isset($updates[$slug])) {
+                return $this->error("No update is available for plugin '{$slug}'.", 404);
+            }
+
+            $result = $this->perform_plugin_update($updates[$slug]);
+            delete_site_transient('update_plugins');
+            return $this->response($result, !empty($result['success']) ? 200 : 500);
+        } finally {
+            $this->release_plugin_update_lock();
+        }
+    }
+
+    public function handle_update_all_plugins(WP_REST_Request $request): WP_REST_Response {
+        $lock = $this->acquire_plugin_update_lock('bulk');
+        if (is_wp_error($lock)) {
+            return $this->error($lock->get_error_message(), 409);
+        }
+
+        try {
+            $force = filter_var($request->get_param('force_check') ?? true, FILTER_VALIDATE_BOOLEAN);
+            $stop_on_error = filter_var($request->get_param('stop_on_error') ?? false, FILTER_VALIDATE_BOOLEAN);
+            $excluded = array_values(array_unique(array_map(
+                'sanitize_key',
+                (array) ($request->get_param('exclude') ?? [])
+            )));
+            $excluded[] = 'shopagg-ai-deployer';
+
+            $updates = $this->get_available_plugin_updates($force);
+            $results = [];
+            $skipped = [];
+            foreach ($updates as $slug => $update) {
+                if (in_array($slug, $excluded, true)) {
+                    $skipped[] = [
+                        'slug' => $slug,
+                        'reason' => $slug === 'shopagg-ai-deployer' ? 'self_update_denied' : 'excluded',
+                    ];
+                    continue;
+                }
+
+                $result = $this->perform_plugin_update($update);
+                $results[] = $result;
+                if (empty($result['success']) && $stop_on_error) {
+                    break;
+                }
+            }
+
+            $failed = array_values(array_filter(
+                $results,
+                static fn(array $result): bool => empty($result['success'])
+            ));
+            $response = [
+                'success' => empty($failed),
+                'updated' => count($results) - count($failed),
+                'failed' => count($failed),
+                'skipped' => $skipped,
+                'results' => $results,
+            ];
+            $this->record_activity('update_all_plugins', [
+                'updated' => $response['updated'],
+                'failed' => $response['failed'],
+                'skipped' => array_column($skipped, 'slug'),
+            ], empty($failed));
+
+            delete_site_transient('update_plugins');
+            return $this->response($response, empty($failed) ? 200 : 207);
+        } finally {
+            $this->release_plugin_update_lock();
+        }
+    }
+
     public function handle_activate_plugin(WP_REST_Request $request): WP_REST_Response {
         $slug = (string) $request->get_param('slug');
         $plugin_file = $this->find_plugin_file($slug);
@@ -361,7 +467,7 @@ class WB_Deployer_API {
             $this->record_activity('activate_plugin', ['slug' => $slug], false);
             return $this->error($result->get_error_message(), 500);
         }
-        wp_clean_plugins_cache(true);
+        wp_clean_plugins_cache(false);
         $this->record_activity('activate_plugin', ['slug' => $slug], true);
         return $this->response(['success' => true, 'message' => "Plugin '{$slug}' activated.", 'file' => $plugin_file]);
     }
@@ -704,6 +810,290 @@ class WB_Deployer_API {
             }
         }
         return null;
+    }
+
+    private function get_available_plugin_updates(bool $force = false): array {
+        require_once ABSPATH . 'wp-admin/includes/plugin.php';
+        require_once ABSPATH . 'wp-admin/includes/update.php';
+
+        if ($force) {
+            delete_site_transient('update_plugins');
+            delete_site_transient('shopagg_ai_deployer_github_metadata');
+            wp_update_plugins();
+        }
+
+        $transient = get_site_transient('update_plugins');
+        if (!is_object($transient)) {
+            wp_update_plugins();
+            $transient = get_site_transient('update_plugins');
+        }
+
+        $available = is_object($transient) && isset($transient->response) && is_array($transient->response)
+            ? $transient->response
+            : [];
+        $installed = get_plugins();
+        $updates = [];
+
+        foreach ($available as $plugin_file => $data) {
+            if (!isset($installed[$plugin_file]) || !is_object($data)) {
+                continue;
+            }
+            $slug = dirname($plugin_file);
+            if ($slug === '.') {
+                $slug = basename($plugin_file, '.php');
+            }
+            $requires_php = (string) ($data->requires_php ?? '');
+            $requires_wp = (string) ($data->requires ?? '');
+            $php_compatible = $requires_php === '' || version_compare(PHP_VERSION, $requires_php, '>=');
+            $wp_compatible = $requires_wp === '' || version_compare(get_bloginfo('version'), $requires_wp, '>=');
+
+            $updates[$slug] = [
+                'slug' => $slug,
+                'file' => $plugin_file,
+                'name' => $installed[$plugin_file]['Name'] ?? $slug,
+                'current_version' => $installed[$plugin_file]['Version'] ?? '',
+                'new_version' => (string) ($data->new_version ?? ''),
+                'requires_php' => $requires_php,
+                'requires_wordpress' => $requires_wp,
+                'tested_wordpress' => (string) ($data->tested ?? ''),
+                'php_compatible' => $php_compatible,
+                'wordpress_compatible' => $wp_compatible,
+                'package_available' => !empty($data->package),
+                'active' => is_plugin_active($plugin_file),
+            ];
+        }
+
+        ksort($updates);
+        return $updates;
+    }
+
+    private function perform_plugin_update(array $update): array {
+        $slug = sanitize_key((string) ($update['slug'] ?? ''));
+        $plugin_file = (string) ($update['file'] ?? '');
+        if ($slug === '' || $plugin_file === '' || $this->find_plugin_file($slug) !== $plugin_file) {
+            return [
+                'success' => false,
+                'slug' => $slug,
+                'error' => 'Plugin was not found or changed after the update check.',
+            ];
+        }
+        if (empty($update['package_available'])) {
+            return [
+                'success' => false,
+                'slug' => $slug,
+                'error' => 'The update package is unavailable. A license or vendor authentication may be required.',
+            ];
+        }
+        if (empty($update['php_compatible']) || empty($update['wordpress_compatible'])) {
+            return [
+                'success' => false,
+                'slug' => $slug,
+                'error' => 'The update is not compatible with the current PHP or WordPress version.',
+            ];
+        }
+
+        $target = $this->get_plugin_backup_target($plugin_file);
+        $files = str_ends_with($target, '.php')
+            ? [$target]
+            : $this->file_ops->list_dir_recursive($target);
+        if (!$files) {
+            return [
+                'success' => false,
+                'slug' => $slug,
+                'error' => 'No plugin files were found to back up.',
+            ];
+        }
+
+        $backup_id = $this->backup->create_snapshot($files, 'plugin-update:' . $slug);
+        if ($backup_id === null) {
+            return [
+                'success' => false,
+                'slug' => $slug,
+                'error' => 'Backup creation failed; the update was cancelled.',
+            ];
+        }
+
+        require_once ABSPATH . 'wp-admin/includes/file.php';
+        require_once ABSPATH . 'wp-admin/includes/plugin.php';
+        require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
+
+        $was_active = is_plugin_active($plugin_file);
+        $before_version = (string) ($update['current_version'] ?? '');
+        $skin = new Automatic_Upgrader_Skin();
+        $upgrader = new Plugin_Upgrader($skin);
+        $upgrade_result = $upgrader->upgrade($plugin_file, ['clear_update_cache' => false]);
+
+        if (is_wp_error($upgrade_result) || $upgrade_result !== true) {
+            $error = $this->get_upgrader_error_message($upgrade_result, $skin);
+            $rollback = $this->rollback_plugin_update($target, $backup_id, $plugin_file, $was_active);
+            $this->record_activity('update_plugin', [
+                'slug' => $slug,
+                'from' => $before_version,
+                'to' => $update['new_version'] ?? '',
+                'backup_id' => $backup_id,
+                'rolled_back' => !empty($rollback['success']),
+                'error' => $error,
+            ], false);
+
+            return [
+                'success' => false,
+                'slug' => $slug,
+                'name' => $update['name'] ?? $slug,
+                'from_version' => $before_version,
+                'target_version' => $update['new_version'] ?? '',
+                'backup_id' => $backup_id,
+                'error' => $error,
+                'rollback' => $rollback,
+            ];
+        }
+
+        wp_clean_plugins_cache(true);
+        if ($was_active && !is_plugin_active($plugin_file)) {
+            $activation = activate_plugin($plugin_file, '', false, false);
+            if (is_wp_error($activation)) {
+                $rollback = $this->rollback_plugin_update($target, $backup_id, $plugin_file, true);
+                $error = 'The plugin updated but could not be reactivated: ' . $activation->get_error_message();
+                $this->record_activity('update_plugin', [
+                    'slug' => $slug,
+                    'from' => $before_version,
+                    'to' => $update['new_version'] ?? '',
+                    'backup_id' => $backup_id,
+                    'rolled_back' => !empty($rollback['success']),
+                    'error' => $error,
+                ], false);
+                return [
+                    'success' => false,
+                    'slug' => $slug,
+                    'backup_id' => $backup_id,
+                    'error' => $error,
+                    'rollback' => $rollback,
+                ];
+            }
+        }
+
+        $health = $this->check_wordpress_health();
+        if (empty($health['ok'])) {
+            $rollback = $this->rollback_plugin_update($target, $backup_id, $plugin_file, $was_active);
+            $health['auto_rollback'] = true;
+            $health['restored_from'] = $backup_id;
+            $health['after_rollback'] = $this->check_wordpress_health();
+            $this->record_activity('update_plugin', [
+                'slug' => $slug,
+                'from' => $before_version,
+                'to' => $update['new_version'] ?? '',
+                'backup_id' => $backup_id,
+                'rolled_back' => !empty($rollback['success']),
+                'health' => $health,
+            ], false);
+
+            return [
+                'success' => false,
+                'slug' => $slug,
+                'name' => $update['name'] ?? $slug,
+                'from_version' => $before_version,
+                'target_version' => $update['new_version'] ?? '',
+                'backup_id' => $backup_id,
+                'error' => 'The site health check failed after the update.',
+                'health' => $health,
+                'rollback' => $rollback,
+            ];
+        }
+
+        $updated_plugins = get_plugins();
+        $after_version = (string) ($updated_plugins[$plugin_file]['Version'] ?? $update['new_version'] ?? '');
+        do_action('litespeed_purge_all');
+        $this->record_activity('update_plugin', [
+            'slug' => $slug,
+            'from' => $before_version,
+            'to' => $after_version,
+            'backup_id' => $backup_id,
+        ], true);
+
+        return [
+            'success' => true,
+            'slug' => $slug,
+            'name' => $update['name'] ?? $slug,
+            'file' => $plugin_file,
+            'from_version' => $before_version,
+            'to_version' => $after_version,
+            'active' => is_plugin_active($plugin_file),
+            'backup_id' => $backup_id,
+            'health' => $health,
+        ];
+    }
+
+    private function get_plugin_backup_target(string $plugin_file): string {
+        $directory = dirname($plugin_file);
+        return $directory === '.'
+            ? 'plugins/' . $plugin_file
+            : 'plugins/' . $directory;
+    }
+
+    private function rollback_plugin_update(
+        string $target,
+        string $backup_id,
+        string $plugin_file,
+        bool $should_be_active
+    ): array {
+        $delete = str_ends_with($target, '.php')
+            ? $this->file_ops->delete_file($target)
+            : $this->file_ops->delete_directory($target);
+        if (empty($delete['success'])) {
+            return [
+                'success' => false,
+                'error' => 'Could not remove the updated plugin before rollback.',
+                'delete' => $delete,
+            ];
+        }
+
+        $restore = $this->backup->restore_snapshot($backup_id);
+        wp_clean_plugins_cache(false);
+        if ($should_be_active && !is_plugin_active($plugin_file)) {
+            $activation = activate_plugin($plugin_file, '', false, false);
+            if (is_wp_error($activation)) {
+                $restore['success'] = false;
+                $restore['activation_error'] = $activation->get_error_message();
+            }
+        }
+        return $restore;
+    }
+
+    private function get_upgrader_error_message(mixed $result, Automatic_Upgrader_Skin $skin): string {
+        if (is_wp_error($result)) {
+            return $result->get_error_message();
+        }
+        $errors = $skin->get_errors();
+        if (is_wp_error($errors) && $errors->has_errors()) {
+            return implode('; ', $errors->get_error_messages());
+        }
+        return 'WordPress did not complete the plugin update.';
+    }
+
+    private function acquire_plugin_update_lock(string $operation): true|WP_Error {
+        $option = 'shopagg_ai_deployer_plugin_update_lock';
+        $existing = get_option($option, null);
+        if (is_array($existing)) {
+            $created = (int) ($existing['created'] ?? 0);
+            if ($created > time() - 30 * MINUTE_IN_SECONDS) {
+                return new WP_Error(
+                    'plugin_update_locked',
+                    'Another plugin update is already running.'
+                );
+            }
+            delete_option($option);
+        }
+
+        $added = add_option($option, [
+            'operation' => sanitize_text_field($operation),
+            'created' => time(),
+        ], '', false);
+        return $added
+            ? true
+            : new WP_Error('plugin_update_locked', 'Could not acquire the plugin update lock.');
+    }
+
+    private function release_plugin_update_lock(): void {
+        delete_option('shopagg_ai_deployer_plugin_update_lock');
     }
 
     private function post_data_from_request(WP_REST_Request $request, bool $creating): array|WP_Error {
