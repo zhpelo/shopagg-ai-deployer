@@ -2,7 +2,7 @@
 
 SHOPAGG AI Deployer 是一个面向 WordPress 的远程开发与恢复插件，让受信任的 AI 助手能够通过认证 REST API 读取插件和主题代码、部署文件、管理备份、执行健康检查，并在 WordPress 无法启动时使用独立急救通道恢复网站。
 
-当前版本：`1.2.1`
+当前版本：`1.3.0`
 
 ## 主要功能
 
@@ -13,6 +13,9 @@ SHOPAGG AI Deployer 是一个面向 WordPress 的远程开发与恢复插件，�
 - 部署后自动检查网站健康状态
 - 写入失败或健康检查失败时自动回滚
 - 列出、查看、恢复和删除备份
+- 检查、单独更新或批量更新已安装插件
+- 插件更新前完整备份，失败或健康检查异常时自动回滚
+- 从 GitHub main 分支获取 SHOPAGG AI Deployer 自身的更新
 - 管理插件的激活、停用和安全删除
 - 激活主题
 - 创建、读取、更新和删除文章
@@ -67,6 +70,9 @@ X-ShopAgg-AI-Deployer-Key: YOUR_API_KEY
 | GET | `/activity` | 查看最近远程操作 |
 | POST | `/deploy` | 批量部署文件并自动备份、检查、回滚 |
 | GET | `/plugins` | 列出插件 |
+| GET | `/plugins/updates` | 检查可用的插件更新 |
+| POST | `/plugins/{slug}/update` | 备份、更新并验证指定插件 |
+| POST | `/plugins/update-all` | 批量更新插件，可设置排除项 |
 | POST | `/plugins/{slug}/activate` | 激活插件 |
 | POST | `/plugins/{slug}/deactivate` | 停用插件 |
 | DELETE | `/plugins/{slug}` | 备份并删除插件 |
@@ -94,6 +100,28 @@ curl -X POST "https://example.com/wp-json/shopagg-ai-deployer/v1/deploy" \
     "health_check": true
   }'
 ```
+
+插件更新示例：
+
+```bash
+# 只检查，不修改
+curl -s "https://example.com/wp-json/shopagg-ai-deployer/v1/plugins/updates?force=1" \
+  -H "X-ShopAgg-AI-Deployer-Key: YOUR_API_KEY"
+
+# 更新指定插件
+curl -X POST "https://example.com/wp-json/shopagg-ai-deployer/v1/plugins/example-plugin/update" \
+  -H "Content-Type: application/json" \
+  -H "X-ShopAgg-AI-Deployer-Key: YOUR_API_KEY" \
+  -d '{"force_check":true}'
+
+# 批量更新，并排除指定插件
+curl -X POST "https://example.com/wp-json/shopagg-ai-deployer/v1/plugins/update-all" \
+  -H "Content-Type: application/json" \
+  -H "X-ShopAgg-AI-Deployer-Key: YOUR_API_KEY" \
+  -d '{"force_check":true,"exclude":["example-plugin"],"stop_on_error":false}'
+```
+
+每个插件更新前都会备份完整插件目录，并在更新后检查网站健康状态；失败时自动回滚。为了避免在请求处理中替换自身，REST 接口禁止远程自更新 SHOPAGG AI Deployer。自身版本由 GitHub main 分支提供，确认变更后可在 WordPress 插件页面使用标准更新流程。
 
 ## Standalone 急救通道
 
@@ -127,6 +155,7 @@ Standalone 不加载 WordPress，可用于：
 - 阻止目录穿越和符号链接越界
 - 禁止通过源码接口读取 API Key、备份、`.env` 和私钥文件
 - 禁止远程停用或删除 Deployer 自身
+- 禁止通过 REST 更新 Deployer 自身，GitHub 更新包固定到具体提交
 - 删除插件和文件前自动创建备份
 - 审计日志不会保存 API Key 和源码内容
 
@@ -142,4 +171,3 @@ backups/
 ## License
 
 GPL-2.0-or-later
-
