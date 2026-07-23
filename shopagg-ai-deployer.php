@@ -3,7 +3,10 @@
  * Plugin Name: SHOPAGG AI Deployer
  * Plugin URI:  https://www.shopagg.com/
  * Description: Secure AI-assisted WordPress development with authenticated APIs, automatic backups, health checks, audit history, and an independent recovery channel.
- * Version:     1.2.1
+ * Version:     1.3.0
+ * Requires at least: 6.5
+ * Requires PHP: 8.0
+ * Update URI:  https://github.com/zhpelo/shopagg-ai-deployer
  * Author:      庄朋龙
  * Author URI:  https://zhuangpenglong.com/
  * License:     GPL-2.0+
@@ -14,7 +17,7 @@
 
 defined('ABSPATH') || exit;
 
-define('SHOPAGG_AI_DEPLOYER_VERSION', '1.2.1');
+define('SHOPAGG_AI_DEPLOYER_VERSION', '1.3.0');
 define('SHOPAGG_AI_DEPLOYER_DIR', plugin_dir_path(__FILE__));
 define('SHOPAGG_AI_DEPLOYER_URL', plugin_dir_url(__FILE__));
 define('SHOPAGG_AI_DEPLOYER_BACKUP_DIR', SHOPAGG_AI_DEPLOYER_DIR . 'backups');
@@ -118,9 +121,11 @@ function shopagg_ai_deployer_protect_internal_directories(): void {
 
 require_once SHOPAGG_AI_DEPLOYER_DIR . 'includes/class-api.php';
 require_once SHOPAGG_AI_DEPLOYER_DIR . 'includes/class-admin.php';
+require_once SHOPAGG_AI_DEPLOYER_DIR . 'includes/class-github-updater.php';
 
 shopagg_ai_deployer_maybe_upgrade();
 shopagg_ai_deployer_admin_bootstrap();
+shopagg_ai_deployer_github_updater_bootstrap();
 
 add_action('rest_api_init', 'shopagg_ai_deployer_register_routes');
 
