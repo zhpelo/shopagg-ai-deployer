@@ -323,6 +323,14 @@ API Key 具有网站完整控制权限。不得在回复、日志、代码、截
 4. 检查 `success`、每个 `results` 项、`backup_id` 和 `health.ok`。
 5. 调用 `GET /health` 并检查实际页面；需要时调用 `POST /cache/clear`。
 
+### 更新插件
+
+1. 用户只要求检查时，调用 `GET /plugins/updates`，不得执行更新。
+2. 用户明确指定插件后，调用 `POST /plugins/{slug}/update`。
+3. 只有用户明确要求更新全部插件时，才调用 `POST /plugins/update-all`；可通过 `exclude` 排除插件。
+4. 每个插件更新前会备份完整目录，更新后检查首页健康状态；失败会自动恢复备份。
+5. SHOPAGG AI Deployer 自身不允许通过 REST 自更新；它从 GitHub 获取版本信息，应在 WordPress 插件页面执行审核后的标准更新。
+
 ### 事故恢复
 
 1. REST 可用：`POST /backups/{id}/restore`。
@@ -385,13 +393,22 @@ curl -X POST "{$rest_url}/deploy" \
 ### 插件与主题
 
 ```bash
+curl -s "{$rest_url}/plugins/updates?force=1" -H "X-ShopAgg-AI-Deployer-Key: {$api_key}"
+curl -X POST "{$rest_url}/plugins/my-plugin/update" \
+  -H "Content-Type: application/json" \
+  -H "X-ShopAgg-AI-Deployer-Key: {$api_key}" \
+  -d '{"force_check":true}'
+curl -X POST "{$rest_url}/plugins/update-all" \
+  -H "Content-Type: application/json" \
+  -H "X-ShopAgg-AI-Deployer-Key: {$api_key}" \
+  -d '{"force_check":true,"exclude":[],"stop_on_error":false}'
 curl -X POST "{$rest_url}/plugins/my-plugin/activate" -H "X-ShopAgg-AI-Deployer-Key: {$api_key}"
 curl -X POST "{$rest_url}/plugins/my-plugin/deactivate" -H "X-ShopAgg-AI-Deployer-Key: {$api_key}"
 curl -X DELETE "{$rest_url}/plugins/my-plugin" -H "X-ShopAgg-AI-Deployer-Key: {$api_key}"
 curl -X POST "{$rest_url}/themes/my-theme/activate" -H "X-ShopAgg-AI-Deployer-Key: {$api_key}"
 ```
 
-插件激活和停用会执行 WordPress 标准钩子。删除插件会先自动备份并返回 `backup_id`。
+插件激活和停用会执行 WordPress 标准钩子。删除插件会先自动备份并返回 `backup_id`。插件更新接口不会返回下载包地址；不兼容、无下载包或更新后健康检查失败时不会保留异常版本。
 
 ### 备份
 
