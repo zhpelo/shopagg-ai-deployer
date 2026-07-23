@@ -1,0 +1,17 @@
+# Runtime credentials
+includes/config.php
+
+# Runtime backups
+backups/
+
+# Local and generated files
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+*.zip
+
+# Development dependencies
+vendor/
+node_modules/
+
