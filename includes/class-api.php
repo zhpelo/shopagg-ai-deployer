@@ -8,14 +8,18 @@
 require_once SHOPAGG_AI_DEPLOYER_DIR . 'includes/class-file-ops.php';
 require_once SHOPAGG_AI_DEPLOYER_DIR . 'includes/class-backup.php';
 
+use ShopAgg\AI_Deployer\Application\ServiceContainer;
+
 class WB_Deployer_API {
 
     private WB_Deployer_File_Ops $file_ops;
     private WB_Deployer_Backup $backup;
+    private ServiceContainer $services;
 
     public function __construct() {
-        $this->file_ops = new WB_Deployer_File_Ops();
-        $this->backup = new WB_Deployer_Backup($this->file_ops);
+        $this->services = ServiceContainer::instance();
+        $this->file_ops = $this->services->files();
+        $this->backup = $this->services->backups();
     }
 
     public function register(): void {
@@ -106,7 +110,7 @@ class WB_Deployer_API {
             'handle_get_code',
             $authenticated
         );
-        $this->route($namespace, '/cache/clear', ['GET', 'POST'], 'handle_clear_cache', $authenticated);
+        $this->route($namespace, '/cache/clear', 'POST', 'handle_clear_cache', $authenticated);
 
         register_rest_route($namespace, '/options/(?P<name>[a-zA-Z0-9_-]+)', [
             array_merge($authenticated, ['methods' => 'GET', 'callback' => [$this, 'handle_get_option']]),
@@ -142,6 +146,9 @@ class WB_Deployer_API {
         if (function_exists('do_action')) {
             do_action('litespeed_control_set_nocache', 'SHOPAGG authenticated API');
         }
+        if (is_user_logged_in() && current_user_can('manage_options')) {
+            return true;
+        }
         $provided = trim((string) $request->get_header('X-ShopAgg-AI-Deployer-Key'));
         $expected = shopagg_ai_deployer_get_api_key();
         if ($provided === '' || $expected === '' || !hash_equals($expected, $provided)) {
@@ -167,6 +174,9 @@ class WB_Deployer_API {
             'php_version' => PHP_VERSION,
             'site_url' => home_url('/'),
             'rest_namespace' => SHOPAGG_AI_DEPLOYER_REST_NS,
+            'abilities_url' => rest_url('wp-abilities/v1'),
+            'authentication' => 'x_shopagg_ai_deployer_key',
+            'full_control' => true,
             'plugins' => ['total' => count($plugins), 'active' => $active_plugins],
             'themes' => ['total' => count($themes), 'active' => get_option('stylesheet')],
             'backups' => ['count' => count($backups), 'latest' => $backups[0]['id'] ?? null],
@@ -181,7 +191,10 @@ class WB_Deployer_API {
 
     public function handle_activity(WP_REST_Request $request): WP_REST_Response {
         $limit = max(1, min(100, (int) ($request->get_param('limit') ?: 30)));
-        $activity = get_option('shopagg_ai_deployer_activity', []);
+        $activity = $this->services->audit()->recent($limit);
+        if (!$activity) {
+            $activity = get_option('shopagg_ai_deployer_activity', []);
+        }
         return $this->response([
             'success' => true,
             'items' => array_slice(is_array($activity) ? $activity : [], 0, $limit),
@@ -189,64 +202,31 @@ class WB_Deployer_API {
     }
 
     public function handle_health(): WP_REST_Response {
-        return $this->response($this->check_wordpress_health());
+        return $this->response($this->services->health()->verify());
     }
 
     public function handle_deploy(WP_REST_Request $request): WP_REST_Response {
         $files = $request->get_param('files');
-        $auto_backup = filter_var($request->get_param('auto_backup') ?? true, FILTER_VALIDATE_BOOLEAN);
-        $health_check = filter_var($request->get_param('health_check') ?? true, FILTER_VALIDATE_BOOLEAN);
-
-        $validation = $this->validate_deployment($files);
-        if (is_wp_error($validation)) {
-            return $this->error($validation->get_error_message(), 400);
+        if (!is_array($files)) {
+            return $this->error('No files provided.', 400);
         }
-
-        $paths = array_column($files, 'path');
-        $backup_id = null;
-        if ($auto_backup) {
-            $backup_id = $this->backup->create_snapshot($paths, 'deploy');
-            if ($backup_id === null) {
-                return $this->error('Backup creation failed; deployment was cancelled.', 500);
-            }
-        }
-
-        $results = [];
+        $changes = [];
         foreach ($files as $file) {
-            $results[] = $this->file_ops->write_file((string) $file['path'], (string) $file['content']);
-        }
-        $success = !in_array(false, array_map(static fn(array $result): bool => !empty($result['success']), $results), true);
-
-        $rollback = null;
-        if (!$success && $backup_id) {
-            $rollback = $this->backup->restore_snapshot($backup_id);
-        }
-
-        $health = null;
-        if ($success && $health_check) {
-            $health = $this->check_wordpress_health();
-            if (empty($health['ok']) && $backup_id) {
-                $rollback = $this->backup->restore_snapshot($backup_id);
-                $health['auto_rollback'] = true;
-                $health['restored_from'] = $backup_id;
-                $success = false;
+            if (!is_array($file)) {
+                continue;
             }
+            $changes[] = [
+                'path' => (string) ($file['path'] ?? ''),
+                'operation' => 'write',
+                'content' => $file['content'] ?? null,
+            ];
         }
-
-        wp_clean_plugins_cache(true);
-        $this->record_activity('deploy', [
-            'paths' => $paths,
-            'backup_id' => $backup_id,
-            'health_check' => $health_check,
-        ], $success);
-
-        return $this->response([
-            'success' => $success,
-            'results' => $results,
-            'backup_id' => $backup_id,
-            'health' => $health,
-            'rollback' => $rollback,
-        ], $success ? 200 : 500);
+        $result = $this->services->deployment()->apply([
+            'operation_id' => sanitize_key((string) ($request->get_param('operation_id') ?: 'api-' . wp_generate_uuid4())),
+            'changes' => $changes,
+            'health_paths' => (array) ($request->get_param('health_paths') ?? []),
+        ]);
+        return $this->response($result, !empty($result['success']) ? 200 : 500);
     }
 
     public function handle_get_file(WP_REST_Request $request): WP_REST_Response {
@@ -311,8 +291,8 @@ class WB_Deployer_API {
 
     public function handle_delete_directory(WP_REST_Request $request): WP_REST_Response {
         $path = trim((string) $request->get_param('path'));
-        if (!$this->is_manageable_path($path) || $path === 'plugins/shopagg-ai-deployer') {
-            return $this->error('Unsafe directory or self-deletion denied.', 400);
+        if (!$this->is_manageable_path($path)) {
+            return $this->error('Unsafe directory.', 400);
         }
         $files = $this->file_ops->list_dir_recursive($path);
         $backup_id = null;
@@ -373,10 +353,6 @@ class WB_Deployer_API {
 
     public function handle_update_plugin(WP_REST_Request $request): WP_REST_Response {
         $slug = sanitize_key((string) $request->get_param('slug'));
-        if ($slug === 'shopagg-ai-deployer') {
-            return $this->error('Remote self-update is denied. Update SHOPAGG AI Deployer through a reviewed deployment.', 400);
-        }
-
         $lock = $this->acquire_plugin_update_lock('single:' . $slug);
         if (is_wp_error($lock)) {
             return $this->error($lock->get_error_message(), 409);
@@ -410,8 +386,6 @@ class WB_Deployer_API {
                 'sanitize_key',
                 (array) ($request->get_param('exclude') ?? [])
             )));
-            $excluded[] = 'shopagg-ai-deployer';
-
             $updates = $this->get_available_plugin_updates($force);
             $results = [];
             $skipped = [];
@@ -419,7 +393,7 @@ class WB_Deployer_API {
                 if (in_array($slug, $excluded, true)) {
                     $skipped[] = [
                         'slug' => $slug,
-                        'reason' => $slug === 'shopagg-ai-deployer' ? 'self_update_denied' : 'excluded',
+                        'reason' => 'excluded',
                     ];
                     continue;
                 }
@@ -474,9 +448,6 @@ class WB_Deployer_API {
 
     public function handle_deactivate_plugin(WP_REST_Request $request): WP_REST_Response {
         $slug = (string) $request->get_param('slug');
-        if ($slug === 'shopagg-ai-deployer') {
-            return $this->error('Remote self-deactivation is denied; use WordPress admin if required.', 400);
-        }
         $plugin_file = $this->find_plugin_file($slug);
         if ($plugin_file === null || !is_plugin_active($plugin_file)) {
             return $this->error('Plugin is not active or was not found.', 404);
@@ -490,9 +461,6 @@ class WB_Deployer_API {
 
     public function handle_delete_plugin(WP_REST_Request $request): WP_REST_Response {
         $slug = (string) $request->get_param('slug');
-        if ($slug === 'shopagg-ai-deployer') {
-            return $this->error('Remote self-deletion is denied.', 400);
-        }
         $plugin_file = $this->find_plugin_file($slug);
         if ($plugin_file === null) {
             return $this->error('Plugin not found.', 404);
@@ -704,9 +672,6 @@ class WB_Deployer_API {
 
     public function handle_get_option(WP_REST_Request $request): WP_REST_Response {
         $name = sanitize_key((string) $request->get_param('name'));
-        if ($this->is_protected_option($name)) {
-            return $this->error('This option is protected. Use the dedicated plugin or theme endpoint.', 403);
-        }
         $sentinel = new stdClass();
         $value = get_option($name, $sentinel);
         return $this->response([
@@ -719,12 +684,17 @@ class WB_Deployer_API {
 
     public function handle_set_option(WP_REST_Request $request): WP_REST_Response {
         $name = sanitize_key((string) $request->get_param('name'));
-        if ($this->is_protected_option($name)) {
-            return $this->error('This option is protected. Use the dedicated plugin or theme endpoint.', 403);
-        }
         $old_value = get_option($name, null);
-        $backup_name = 'shopagg_option_backup_' . gmdate('Ymd_His') . '_' . substr(md5($name), 0, 8);
-        update_option($backup_name, ['name' => $name, 'value' => $old_value, 'created' => gmdate('c')], false);
+        $backup_name = 'option-' . wp_generate_uuid4();
+        $backups = get_option('shopagg_ai_deployer_option_backups', []);
+        $backups = is_array($backups) ? $backups : [];
+        array_unshift($backups, [
+            'id' => $backup_name,
+            'name' => $name,
+            'value' => $old_value,
+            'created' => gmdate('c'),
+        ]);
+        update_option('shopagg_ai_deployer_option_backups', array_slice($backups, 0, 20), false);
         $updated = update_option($name, $request->get_param('value'));
         $this->record_activity('set_option', ['name' => $name, 'backup_option' => $backup_name], true);
         return $this->response([
@@ -1152,76 +1122,12 @@ class WB_Deployer_API {
             || str_contains($path, '/.git/');
     }
 
-    private function is_protected_option(string $name): bool {
-        return in_array($name, [
-            'active_plugins',
-            'active_sitewide_plugins',
-            'template',
-            'stylesheet',
-            'siteurl',
-            'home',
-            'cron',
-            'wp_user_roles',
-        ], true);
-    }
-
     private function check_wordpress_health(): array {
-        $started = microtime(true);
-        $url = add_query_arg('shopagg_health', (string) time(), home_url('/'));
-        $response = wp_remote_get($url, [
-            'timeout' => 15,
-            'sslverify' => true,
-            'redirection' => 3,
-            'headers' => ['Cache-Control' => 'no-cache'],
-        ]);
-        if (is_wp_error($response)) {
-            return [
-                'ok' => false,
-                'error' => $response->get_error_message(),
-                'duration_ms' => (int) round((microtime(true) - $started) * 1000),
-            ];
-        }
-
-        $status = (int) wp_remote_retrieve_response_code($response);
-        $body = strtolower((string) wp_remote_retrieve_body($response));
-        $fatal_markers = [
-            'fatal error',
-            'parse error',
-            'uncaught error',
-            'there has been a critical error',
-            'error establishing a database connection',
-        ];
-        $matched = null;
-        foreach ($fatal_markers as $marker) {
-            if (str_contains($body, $marker)) {
-                $matched = $marker;
-                break;
-            }
-        }
-
-        return [
-            'ok' => $status >= 200 && $status < 400 && $matched === null,
-            'status_code' => $status,
-            'fatal_marker' => $matched,
-            'duration_ms' => (int) round((microtime(true) - $started) * 1000),
-        ];
+        return $this->services->health()->verify();
     }
 
     private function record_activity(string $action, array $details, bool $success): void {
-        $activity = get_option('shopagg_ai_deployer_activity', []);
-        if (!is_array($activity)) {
-            $activity = [];
-        }
-        array_unshift($activity, [
-            'time' => gmdate('c'),
-            'action' => $action,
-            'success' => $success,
-            'details' => $details,
-            'ip_hash' => isset($_SERVER['REMOTE_ADDR'])
-                ? substr(hash_hmac('sha256', (string) $_SERVER['REMOTE_ADDR'], wp_salt('auth')), 0, 12)
-                : null,
-        ]);
-        update_option('shopagg_ai_deployer_activity', array_slice($activity, 0, 100), false);
+        $this->services->audit()->record($action, $details, $success);
     }
 
     private function response(array $data, int $status = 200): WP_REST_Response {

@@ -1,5 +1,7 @@
 # Runtime credentials
 includes/config.php
+includes/.htaccess
+includes/web.config
 
 # Runtime backups
 backups/
@@ -14,4 +16,3 @@ Thumbs.db
 # Development dependencies
 vendor/
 node_modules/
-

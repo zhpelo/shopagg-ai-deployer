@@ -17,7 +17,10 @@ class WB_Deployer_Backup {
         int $max_backups = 30
     ) {
         $this->file_ops = $file_ops ?? new WB_Deployer_File_Ops();
-        $this->backup_dir = $backup_dir ?? $this->file_ops->resolve('plugins/shopagg-ai-deployer/backups');
+        $this->backup_dir = $backup_dir
+            ?? (defined('SHOPAGG_AI_DEPLOYER_BACKUP_DIR')
+                ? SHOPAGG_AI_DEPLOYER_BACKUP_DIR
+                : $this->file_ops->resolve('plugins/shopagg-ai-deployer/backups'));
         $this->max_backups = max(5, $max_backups);
     }
 
@@ -29,7 +32,7 @@ class WB_Deployer_Backup {
 
         $id = $this->create_unique_id();
         $snapshot_dir = $this->backup_dir . '/' . $id;
-        if (!@mkdir($snapshot_dir, 0755, true)) {
+        if (!@mkdir($snapshot_dir, 0700, true)) {
             return null;
         }
 
@@ -38,6 +41,11 @@ class WB_Deployer_Backup {
         foreach ($relative_paths as $relative_path) {
             $content = $this->file_ops->read_file($relative_path);
             if ($content === false) {
+                $info = $this->file_ops->file_info($relative_path);
+                if (!empty($info['exists'])) {
+                    $this->recursive_delete($snapshot_dir);
+                    return null;
+                }
                 $manifest[$relative_path] = [
                     'existed' => false,
                     'size' => 0,
@@ -48,25 +56,16 @@ class WB_Deployer_Backup {
 
             $destination = $snapshot_dir . '/' . ltrim(str_replace('\\', '/', $relative_path), '/');
             $destination_dir = dirname($destination);
-            if (!is_dir($destination_dir) && !@mkdir($destination_dir, 0755, true)) {
-                $manifest[$relative_path] = [
-                    'existed' => true,
-                    'size' => strlen($content),
-                    'sha256' => hash('sha256', $content),
-                    'backup_error' => 'Cannot create backup directory.',
-                ];
-                continue;
+            if (!is_dir($destination_dir) && !@mkdir($destination_dir, 0700, true)) {
+                $this->recursive_delete($snapshot_dir);
+                return null;
             }
 
             if (@file_put_contents($destination, $content, LOCK_EX) === false) {
-                $manifest[$relative_path] = [
-                    'existed' => true,
-                    'size' => strlen($content),
-                    'sha256' => hash('sha256', $content),
-                    'backup_error' => 'Cannot write backup file.',
-                ];
-                continue;
+                $this->recursive_delete($snapshot_dir);
+                return null;
             }
+            @chmod($destination, 0600);
 
             $size = strlen($content);
             $total_bytes += $size;
@@ -95,6 +94,7 @@ class WB_Deployer_Backup {
             $this->recursive_delete($snapshot_dir);
             return null;
         }
+        @chmod($snapshot_dir . '/manifest.json', 0600);
 
         $this->cleanup();
         return $id;
