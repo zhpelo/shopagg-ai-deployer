@@ -109,7 +109,7 @@ final class Abilities {
             'Validate paths, size limits, PHP syntax, and file hash preconditions without changing the site.',
             'shopagg-code', $this->objectSchema(['changes' => $changesSchema], ['changes']),
             fn($input): array => $this->services->deployment()->preview((array) $input),
-            static fn(): bool => shopagg_ai_deployer_has_api_access(), true, false, true);
+            static fn(): bool => shopagg_ai_deployer_has_api_access(), false, false, true);
 
         $this->register('deployment-apply', 'Apply code deployment',
             'Apply a preconditioned code transaction with fail-closed backup, health verification, and automatic rollback.',
@@ -119,7 +119,7 @@ final class Abilities {
                 'health_paths' => ['type' => 'array', 'items' => ['type' => 'string'], 'maxItems' => 9],
             ], ['operation_id', 'changes']),
             fn($input): array => $this->services->deployment()->apply((array) $input),
-            static fn(): bool => shopagg_ai_deployer_has_api_access(), false, true, true);
+            static fn(): bool => shopagg_ai_deployer_has_api_access(), false, true, false);
 
         $this->register('rest-discover', 'Discover WordPress REST resources',
             'Discover any registered WordPress REST route and its argument summary.',
